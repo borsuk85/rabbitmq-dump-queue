@@ -2,15 +2,16 @@ package main
 
 import (
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
+	_ "github.com/glebarez/go-sqlite"
+	"github.com/rabbitmq/amqp091-go"
 	"io/ioutil"
 	"os"
 	"path"
 	"strings"
-
-	"github.com/rabbitmq/amqp091-go"
 )
 
 var (
@@ -20,6 +21,7 @@ var (
 	ack         = flag.Bool("ack", false, "Acknowledge messages")
 	maxMessages = flag.Uint("max-messages", 1000, "Maximum number of messages to dump or 0 for unlimited")
 	outputDir   = flag.String("output-dir", ".", "Directory in which to save the dumped messages")
+	db          = flag.Bool("db", false, "Dump messages to sqlite db")
 	full        = flag.Bool("full", false, "Dump the message, its properties and headers")
 	verbose     = flag.Bool("verbose", false, "Print progress")
 )
@@ -31,7 +33,7 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	err := dumpMessagesFromQueue(*uri, *queue, *maxMessages, *outputDir)
+	err := dumpMessagesFromQueue(*uri, *queue, *maxMessages, *outputDir, *db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
@@ -50,7 +52,7 @@ func dial(amqpURI string) (*amqp091.Connection, error) {
 	return conn, err
 }
 
-func dumpMessagesFromQueue(amqpURI string, queueName string, maxMessages uint, outputDir string) error {
+func dumpMessagesFromQueue(amqpURI string, queueName string, maxMessages uint, outputDir string, db bool) error {
 	if queueName == "" {
 		return fmt.Errorf("Must supply queue name")
 	}
@@ -70,6 +72,22 @@ func dumpMessagesFromQueue(amqpURI string, queueName string, maxMessages uint, o
 		return fmt.Errorf("Channel: %s", err)
 	}
 
+	database, err := sql.Open("sqlite", outputDir+"/dump.db")
+	defer func() {
+		database.Close()
+		verboseLog("DB connection closed")
+	}()
+	_, err = database.Exec(
+		"CREATE TABLE IF NOT EXISTS dump (" +
+			"id INTEGER PRIMARY KEY AUTOINCREMENT," +
+			"message STRING NOT NULL," +
+			"headers STRING NOT NULL" +
+			");")
+
+	if err != nil {
+		return fmt.Errorf("SQLite: : %s", err)
+	}
+
 	verboseLog(fmt.Sprintf("Pulling messages from queue %q", queueName))
 	for messagesReceived := uint(0); maxMessages == 0 || messagesReceived < maxMessages; messagesReceived++ {
 		msg, ok, err := channel.Get(queueName,
@@ -84,20 +102,42 @@ func dumpMessagesFromQueue(amqpURI string, queueName string, maxMessages uint, o
 			break
 		}
 
-		err = saveMessageToFile(msg.Body, outputDir, messagesReceived)
-		if err != nil {
-			return fmt.Errorf("Save message: %s", err)
-		}
-
-		if *full {
-			err = savePropsAndHeadersToFile(msg, outputDir, messagesReceived)
+		if db {
+			saveMessageToDb(database, msg)
+		} else {
+			err = saveMessageToFile(msg.Body, outputDir, messagesReceived)
 			if err != nil {
-				return fmt.Errorf("Save props and headers: %s", err)
+				return fmt.Errorf("save message: %s", err)
+			}
+
+			if *full {
+				err = savePropsAndHeadersToFile(msg, outputDir, messagesReceived)
+				if err != nil {
+					return fmt.Errorf("save props and headers: %s", err)
+				}
 			}
 		}
 	}
 
 	return nil
+}
+
+func saveMessageToDb(database *sql.DB, msg amqp091.Delivery) (err error) {
+	extras := make(map[string]interface{})
+	extras["properties"] = getProperties(msg)
+	extras["headers"] = msg.Headers
+
+	data, err := json.MarshalIndent(extras, "", "  ")
+	if err != nil {
+		return err
+	}
+	query := "INSERT INTO dump (message, headers) VALUES (" + "'" + string(msg.Body) + "','" + string(data) + "'" + ")"
+	_, err = database.Exec(query)
+	if err != nil {
+		fmt.Errorf("DB: %s", err)
+	}
+
+	return err
 }
 
 func saveMessageToFile(body []byte, outputDir string, counter uint) error {
